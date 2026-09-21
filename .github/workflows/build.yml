@@ -1,0 +1,70 @@
+name: Build Medicine Reminder Firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.3
+
+    steps:
+      - name: Checkout medicine reminder repository
+        uses: actions/checkout@v4
+        with:
+          path: app
+
+      - name: Checkout pinned AI Passport baseline
+        uses: actions/checkout@v4
+        with:
+          repository: FoloToy/ai-passport
+          ref: 1051209d807fb26f943236b7e02281f13d39bc90
+          path: firmware
+
+      - name: Create application branch and apply overlay
+        shell: bash
+        run: |
+          git -C firmware switch -c feature/medicine-reminder
+          cp -a app/overlay/main/. firmware/main/
+          cp -a app/overlay/tests/. firmware/tests/
+
+      - name: Run medicine model tests
+        shell: bash
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            -Ifirmware/main \
+            firmware/tests/test_medicine_model.c \
+            firmware/main/medicine_model.c \
+            -o /tmp/test_medicine_model
+          /tmp/test_medicine_model
+
+      - name: Run repository static validation
+        working-directory: firmware
+        shell: bash
+        run: ./tools/validate.sh --static
+
+      - name: Build and verify merged firmware
+        working-directory: firmware
+        shell: bash
+        run: |
+          source "$IDF_PATH/export.sh"
+          ./tools/validate.sh --firmware
+          test -f build/FoloToy-AI-Passport-full.bin
+          sha256sum build/FoloToy-AI-Passport-full.bin
+
+      - name: Upload flashable firmware and debug bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: medicine-reminder-firmware-${{ github.sha }}
+          path: |
+            firmware/build/FoloToy-AI-Passport-full.bin
+            firmware/build/firmware/**
+          if-no-files-found: error
