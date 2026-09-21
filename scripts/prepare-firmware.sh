@@ -14,10 +14,11 @@ fi
 
 git -C "${firmware_root}" fetch origin "${upstream_commit}"
 git -C "${firmware_root}" checkout --detach "${upstream_commit}"
-git -C "${firmware_root}" switch -C feature/medicine-reminder
+git -C "${firmware_root}" switch -C feature/medicine-reminder-v2
 
 cp -a "${repo_root}/overlay/main/." "${firmware_root}/main/"
 cp -a "${repo_root}/overlay/tests/." "${firmware_root}/tests/"
+cat "${repo_root}/overlay/sdkconfig.defaults.append" >> "${firmware_root}/sdkconfig.defaults"
 
 printf 'Prepared complete firmware checkout at %s\n' "${firmware_root}"
 printf 'Baseline commit: %s\n' "${upstream_commit}"

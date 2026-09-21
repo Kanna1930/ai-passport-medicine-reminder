@@ -31,15 +31,21 @@ esp_err_t medicine_store_init(medicine_model_t *model) {
     uint8_t hour = model->reminder_hour;
     uint8_t minute = model->reminder_minute;
     uint8_t enabled = model->reminder_enabled ? 1 : 0;
+    int32_t taken_day = -1;
+    int32_t skipped_day = -1;
     (void)nvs_get_u8(handle, "hour", &hour);
     (void)nvs_get_u8(handle, "minute", &minute);
     (void)nvs_get_u8(handle, "enabled", &enabled);
+    (void)nvs_get_i32(handle, "taken_day", &taken_day);
+    (void)nvs_get_i32(handle, "skip_day", &skipped_day);
     nvs_close(handle);
 
     if (!medicine_model_set_reminder(model, hour, minute, enabled != 0)) {
         ESP_LOGW(TAG, "Stored reminder is invalid; using defaults");
         medicine_model_set_reminder(model, 8, 0, true);
     }
+    model->last_taken_day = taken_day;
+    model->last_skipped_day = skipped_day;
     s_ready = true;
     return ESP_OK;
 }
@@ -54,7 +60,9 @@ esp_err_t medicine_store_save(const medicine_model_t *model) {
 
     if ((err = nvs_set_u8(handle, "hour", model->reminder_hour)) == ESP_OK &&
         (err = nvs_set_u8(handle, "minute", model->reminder_minute)) == ESP_OK &&
-        (err = nvs_set_u8(handle, "enabled", model->reminder_enabled ? 1 : 0)) == ESP_OK) {
+        (err = nvs_set_u8(handle, "enabled", model->reminder_enabled ? 1 : 0)) == ESP_OK &&
+        (err = nvs_set_i32(handle, "taken_day", model->last_taken_day)) == ESP_OK &&
+        (err = nvs_set_i32(handle, "skip_day", model->last_skipped_day)) == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);

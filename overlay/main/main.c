@@ -1,6 +1,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 #include "bsp_audio.h"
 #include "bsp_button.h"
@@ -13,28 +15,35 @@
 #include "lvgl.h"
 #include "medicine_model.h"
 #include "medicine_store.h"
+#include "power_manager.h"
+#include "time_sync.h"
 
 #define INPUT_QUEUE_DEPTH 8
 #define AUDIO_QUEUE_DEPTH 1
 #define AUDIO_SAMPLE_RATE 8000
 #define AUDIO_CHUNK 160
+#define HOME_IDLE_STANDBY_MS 30000ULL
+#define CONFIRM_STANDBY_MS 5000ULL
 
-#define COLOR_BG       0x101827
-#define COLOR_PANEL    0x1B2A41
-#define COLOR_ACCENT   0x67E8F9
-#define COLOR_OK       0x86EFAC
-#define COLOR_WARN     0xFDBA74
-#define COLOR_ALARM    0x7F1D1D
-#define COLOR_TEXT     0xF8FAFC
-#define COLOR_MUTED    0x94A3B8
+#define COLOR_BG       0xF4F7FB
+#define COLOR_CARD     0xFFFFFF
+#define COLOR_TEXT     0x152033
+#define COLOR_MUTED    0x64748B
+#define COLOR_ACCENT   0x2563EB
+#define COLOR_OK       0x16A34A
+#define COLOR_WARN     0xD97706
+#define COLOR_DANGER   0xDC2626
+#define COLOR_SOFTBLUE 0xE8F0FF
+#define COLOR_SOFTGREEN 0xEAF8EF
+#define COLOR_SOFTRED  0xFDECEC
 
 typedef enum {
-    SCREEN_HOME = 0,
-    SCREEN_SET_CLOCK_HOUR,
-    SCREEN_SET_CLOCK_MINUTE,
+    SCREEN_NETWORK = 0,
+    SCREEN_HOME,
     SCREEN_SET_REMINDER_HOUR,
     SCREEN_SET_REMINDER_MINUTE,
     SCREEN_ALARM,
+    SCREEN_CONFIRM,
 } screen_mode_t;
 
 typedef struct {
@@ -45,7 +54,7 @@ typedef struct {
 static const char *TAG = "medicine";
 
 static medicine_model_t s_model;
-static screen_mode_t s_mode;
+static screen_mode_t s_mode = SCREEN_NETWORK;
 static uint8_t s_edit_hour;
 static uint8_t s_edit_minute;
 static QueueHandle_t s_input_queue;
@@ -54,404 +63,489 @@ static TaskHandle_t s_input_task;
 static volatile bool s_input_ready;
 static bool s_button_ok;
 static bool s_audio_ok;
+static volatile bool s_wake_pending;
 
 static lv_obj_t *s_screen;
 static lv_obj_t *s_title;
-static lv_obj_t *s_big;
-static lv_obj_t *s_sub;
-static lv_obj_t *s_status;
+static lv_obj_t *s_time;
+static lv_obj_t *s_card;
+static lv_obj_t *s_primary;
+static lv_obj_t *s_secondary;
 static lv_obj_t *s_hint;
 static lv_timer_t *s_timer;
-static uint8_t s_last_minute = 0xFF;
-static medicine_day_status_t s_last_day_status = (medicine_day_status_t)0xFF;
+
+static uint64_t s_home_idle_deadline_ms;
+static uint64_t s_confirm_deadline_ms;
+static const char *s_confirm_text = "å·²è®°å½•";
+static time_sync_state_t s_last_sync_state = (time_sync_state_t)-1;
+static int s_last_display_minute = -1;
+static medicine_day_status_t s_last_day_status = (medicine_day_status_t)-1;
 
 static uint64_t now_ms(void) {
     return (uint64_t)esp_timer_get_time() / 1000ULL;
 }
 
-static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, uint32_t color,
-                            int x, int y, int width, lv_text_align_t align) {
+static bool local_snapshot(time_t *epoch_out, int32_t *day_out,
+                           uint16_t *minute_of_day_out,
+                           uint8_t *hour_out, uint8_t *minute_out) {
+    time_t now = time(NULL);
+    if (now < 1700000000) return false;
+    struct tm tm_now;
+    if (!localtime_r(&now, &tm_now)) return false;
+    if (epoch_out) *epoch_out = now;
+    if (day_out) {
+        *day_out = (tm_now.tm_year + 1900) * 10000 +
+                   (tm_now.tm_mon + 1) * 100 + tm_now.tm_mday;
+    }
+    uint16_t minute_of_day = (uint16_t)tm_now.tm_hour * 60U + tm_now.tm_min;
+    if (minute_of_day_out) *minute_of_day_out = minute_of_day;
+    if (hour_out) *hour_out = (uint8_t)tm_now.tm_hour;
+    if (minute_out) *minute_out = (uint8_t)tm_now.tm_min;
+    return true;
+}
+
+static int64_t epoch_minute_now(void) {
+    time_t now = time(NULL);
+    return now >= 0 ? (int64_t)now / 60 : -1;
+}
+
+static time_t next_wake_epoch(void) {
+    time_t now = time(NULL);
+    if (s_model.snooze_active && s_model.snooze_epoch_minute > 0) {
+        time_t snooze = (time_t)(s_model.snooze_epoch_minute * 60);
+        if (snooze > now) return snooze;
+    }
+
+    struct tm local;
+    if (!localtime_r(&now, &local)) return now + 60;
+    int32_t day = (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
+    medicine_day_status_t status = medicine_model_day_status(&s_model, day);
+
+    struct tm target = local;
+    target.tm_hour = s_model.reminder_hour;
+    target.tm_min = s_model.reminder_minute;
+    target.tm_sec = 0;
+    time_t wake = mktime(&target);
+    if (wake <= now + 2 || status != MEDICINE_DAY_WAITING || s_model.last_trigger_day == day) {
+        target.tm_mday += 1;
+        target.tm_isdst = -1;
+        wake = mktime(&target);
+    }
+    return wake > now ? wake : now + 60;
+}
+
+static lv_obj_t *label_create(lv_obj_t *parent, const lv_font_t *font,
+                              uint32_t color, int width, lv_text_align_t align) {
     lv_obj_t *label = lv_label_create(parent);
-    lv_obj_set_pos(label, x, y);
     lv_obj_set_width(label, width);
     lv_obj_set_style_text_font(label, font, 0);
     lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
     lv_obj_set_style_text_align(label, align, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
     return label;
 }
 
-static const char *status_text(medicine_day_status_t status) {
+static lv_obj_t *card_create(lv_obj_t *parent, int x, int y, int w, int h, uint32_t color) {
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_pos(card, x, y);
+    lv_obj_set_size(card, w, h);
+    lv_obj_set_style_bg_color(card, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    return card;
+}
+
+static void reset_home_idle(void) {
+    s_home_idle_deadline_ms = now_ms() + HOME_IDLE_STANDBY_MS;
+}
+
+static const char *day_status_text(medicine_day_status_t status) {
     switch (status) {
-        case MEDICINE_DAY_TAKEN: return "TODAY  TAKEN";
-        case MEDICINE_DAY_SKIPPED: return "TODAY  SKIPPED";
+        case MEDICINE_DAY_TAKEN: return "ä»Šæ—¥çŠ¶æ€ï¼šå·²æœè¯";
+        case MEDICINE_DAY_SKIPPED: return "ä»Šæ—¥çŠ¶æ€ï¼šå·²è·³è¿‡";
         case MEDICINE_DAY_WAITING:
-        default: return "TODAY  WAITING";
+        default: return "ä»Šæ—¥çŠ¶æ€ï¼šå¾…æœè¯";
     }
 }
 
-static void set_screen_background(uint32_t color) {
-    lv_obj_set_style_bg_color(s_screen, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_opa(s_screen, LV_OPA_COVER, 0);
-}
+static void render_network(void) {
+    time_sync_state_t state = time_sync_get_state();
+    lv_label_set_text(s_title, "è‡ªåŠ¨æ ¡æ—¶");
+    lv_label_set_text(s_time, "--:--");
+    lv_obj_set_style_bg_color(s_card, lv_color_hex(COLOR_SOFTBLUE), 0);
+    lv_obj_set_style_text_color(s_primary, lv_color_hex(COLOR_TEXT), 0);
+    lv_obj_set_style_text_color(s_secondary, lv_color_hex(COLOR_MUTED), 0);
 
-static void render_ui(void) {
-    if (!s_screen) return;
-
-    uint64_t now = now_ms();
-    uint8_t hour = 0;
-    uint8_t minute = 0;
-    (void)medicine_model_clock(&s_model, now, &hour, &minute, NULL);
-
-    lv_obj_set_style_text_color(s_title, lv_color_hex(COLOR_ACCENT), 0);
-    lv_obj_set_style_text_color(s_big, lv_color_hex(COLOR_TEXT), 0);
-    lv_obj_set_style_text_color(s_sub, lv_color_hex(COLOR_MUTED), 0);
-    lv_obj_set_style_text_color(s_status, lv_color_hex(COLOR_OK), 0);
-    lv_obj_set_style_text_color(s_hint, lv_color_hex(COLOR_MUTED), 0);
-
-    switch (s_mode) {
-        case SCREEN_HOME: {
-            set_screen_background(COLOR_BG);
-            lv_label_set_text(s_title, "MEDS");
-            lv_label_set_text_fmt(s_big, "%02u:%02u", hour, minute);
-            if (s_model.reminder_enabled) {
-                lv_label_set_text_fmt(s_sub, "NEXT  %02u:%02u", s_model.reminder_hour,
-                                      s_model.reminder_minute);
-            } else {
-                lv_label_set_text(s_sub, "REMINDER  OFF");
-            }
-            medicine_day_status_t status = medicine_model_day_status(&s_model, now);
-            lv_label_set_text(s_status, status_text(status));
-            if (!s_button_ok) {
-                lv_label_set_text(s_hint, "BUTTON ERROR\nCHECK HARDWARE");
-            } else {
-                lv_label_set_text(s_hint,
-                                  "HOLD OK  REMINDER\nHOLD UP  CLOCK   HOLD DOWN  ON/OFF");
-            }
+    switch (state) {
+        case TIME_SYNC_CONNECTING:
+            lv_label_set_text(s_primary, "æ­£åœ¨è¿æ¥å·²ä¿å­˜çš„ Wi-Fi");
+            lv_label_set_text(s_secondary, "è”ç½‘ä»…ç”¨äºæ ¡å‡†æ—¶é—´\næ ¡æ—¶å®Œæˆåä¼šè‡ªåŠ¨å…³é—­ç½‘ç»œ");
+            lv_label_set_text(s_hint, "è¯·ç¨å€™");
             break;
-        }
-        case SCREEN_SET_CLOCK_HOUR:
-            set_screen_background(COLOR_PANEL);
-            lv_label_set_text(s_title, "SET CURRENT HOUR");
-            lv_label_set_text_fmt(s_big, "%02u:--", s_edit_hour);
-            lv_label_set_text(s_sub, "UP / DOWN  CHANGE");
-            lv_label_set_text(s_status, "OK  NEXT");
-            lv_label_set_text(s_hint, "Clock is re-set after power loss");
+        case TIME_SYNC_PROVISIONING:
+            lv_label_set_text(s_primary, "é¦–æ¬¡ä½¿ç”¨ï¼Œè¯·å®Œæˆé…ç½‘");
+            lv_label_set_text(s_secondary,
+                              "æ‰‹æœºæ‰“å¼€å¾®ä¿¡å°ç¨‹åº\nâ€œè“ç‰™é…ç½‘-FoloToy AI PASSPORTâ€\né€‰æ‹© BLUFI_FoloPassport\nè¿æ¥ 2.4GHz Wi-Fi");
+            lv_label_set_text(s_hint, "é…ç½‘æˆåŠŸåä¼šè‡ªåŠ¨æ ¡æ—¶");
             break;
-        case SCREEN_SET_CLOCK_MINUTE:
-            set_screen_background(COLOR_PANEL);
-            lv_label_set_text(s_title, "SET CURRENT MINUTE");
-            lv_label_set_text_fmt(s_big, "%02u:%02u", s_edit_hour, s_edit_minute);
-            lv_label_set_text(s_sub, "UP / DOWN  CHANGE");
-            lv_label_set_text(s_status, "OK  SAVE CLOCK");
-            lv_label_set_text(s_hint, "Use the current local time");
+        case TIME_SYNC_PHONE_CONNECTED:
+            lv_label_set_text(s_primary, "æ‰‹æœºå·²è¿æ¥è®¾å¤‡");
+            lv_label_set_text(s_secondary, "è¯·åœ¨å°ç¨‹åºä¸­é€‰æ‹© 2.4GHz Wi-Fi\nå¹¶å‘é€å¯†ç ");
+            lv_label_set_text(s_hint, "ç­‰å¾… Wi-Fi ä¿¡æ¯");
             break;
-        case SCREEN_SET_REMINDER_HOUR:
-            set_screen_background(COLOR_PANEL);
-            lv_label_set_text(s_title, "SET REMINDER HOUR");
-            lv_label_set_text_fmt(s_big, "%02u:--", s_edit_hour);
-            lv_label_set_text(s_sub, "UP / DOWN  CHANGE");
-            lv_label_set_text(s_status, "OK  NEXT");
-            lv_label_set_text(s_hint, "HOLD OK  CANCEL");
+        case TIME_SYNC_WIFI_CONNECTING:
+            lv_label_set_text(s_primary, "æ­£åœ¨è¿æ¥ Wi-Fi");
+            lv_label_set_text(s_secondary, "è¿æ¥æˆåŠŸåå°†ç«‹å³æ ¡å‡†æ—¶é—´");
+            lv_label_set_text(s_hint, "è¯·ç¨å€™");
             break;
-        case SCREEN_SET_REMINDER_MINUTE:
-            set_screen_background(COLOR_PANEL);
-            lv_label_set_text(s_title, "SET REMINDER MINUTE");
-            lv_label_set_text_fmt(s_big, "%02u:%02u", s_edit_hour, s_edit_minute);
-            lv_label_set_text(s_sub, "UP / DOWN  5 MIN");
-            lv_label_set_text(s_status, "OK  SAVE REMINDER");
-            lv_label_set_text(s_hint, "HOLD OK  CANCEL");
+        case TIME_SYNC_SNTP:
+            lv_label_set_text(s_primary, "ç½‘ç»œå·²è¿æ¥");
+            lv_label_set_text(s_secondary, "æ­£åœ¨ä»ç½‘ç»œè‡ªåŠ¨æ ¡å‡†æ—¶é—´");
+            lv_label_set_text(s_hint, "æ ¡æ—¶åè‡ªåŠ¨å…³é—­ Wi-Fi å’Œè“ç‰™");
             break;
-        case SCREEN_ALARM:
-            set_screen_background(COLOR_ALARM);
-            lv_obj_set_style_text_color(s_title, lv_color_hex(COLOR_WARN), 0);
-            lv_label_set_text(s_title, "TIME TO TAKE MEDICINE");
-            lv_label_set_text_fmt(s_big, "%02u:%02u", s_model.reminder_hour,
-                                  s_model.reminder_minute);
-            lv_obj_set_style_text_color(s_sub, lv_color_hex(COLOR_TEXT), 0);
-            lv_label_set_text(s_sub, "OK  TAKEN");
-            lv_obj_set_style_text_color(s_status, lv_color_hex(COLOR_WARN), 0);
-            lv_label_set_text(s_status, "UP  SNOOZE 10 MIN");
-            lv_obj_set_style_text_color(s_hint, lv_color_hex(COLOR_TEXT), 0);
-            lv_label_set_text(s_hint, "DOWN  SKIP TODAY");
+        case TIME_SYNC_DONE:
+            lv_label_set_text(s_primary, "æ ¡æ—¶æˆåŠŸ");
+            lv_label_set_text(s_secondary, "ç½‘ç»œå·²å…³é—­ï¼Œè¿›å…¥çœç”µè¿è¡Œ");
+            lv_label_set_text(s_hint, "å³å°‡è¿›å…¥æé†’é¡µé¢");
+            break;
+        case TIME_SYNC_FAILED:
+            lv_obj_set_style_bg_color(s_card, lu_color_hex(COLOR_SOFTRED), 0);
+            lv_label_set_text(s_primary, "æ ¡æ—¶å¤±è´¥");
+            lv_label_set_text(s_secondary, "è¯·æ£€æŸ¥ç½‘ç»œåé‡è¯•");
+            lv_label_set_text(s_hint, "OK é‡è¯•   DOWN é‡æ–°é…ç½‘");
+            break;
+        case TIME_SYNC_IDLE:
+        default:
+            lv_label_set_text(s_primary, "å‡†å¤‡è‡ªåŠ¨æ ¡æ—¶");
+            lv_label_set_text(s_secondary, "ç”µç½‘åªç”¨äºè·å–å‡†ç¡®æ—¶é—´");
+            lv_label_set_text(s_hint, "è¯·ç¨å€™");
             break;
     }
 }
 
-static void build_ui(void) {
-    s_screen = lv_obj_create(NULL);
-    lv_obj_set_style_border_width(s_screen, 0, 0);
-    lv_obj_set_style_pad_all(s_screen, 0, 0);
-    lv_obj_clear_flag(s_screen, LV_OBJ_FLAG_SCROLLABLE);
+static void render_home(void) {
+    uint8_t hour = 0, minute = 0;
+    int32_t day = -1;
+    (void)local_snapshot(NULL, &day, NULL, &hour, &minute);
+    medicine_day_status_t status = medicine_model_day_status(&s_model, day);
 
-    s_title = make_label(s_screen, &lv_font_montserrat_14, COLOR_ACCENT,
-                         10, 22, 220, LV_TEXT_ALIGN_CENTER);
-    s_big = make_label(s_screen, &lv_font_montserrat_20, COLOR_TEXT,
-                       10, 94, 220, LV_TEXT_ALIGN_CENTER);
-    s_sub = make_label(s_screen, &lv_font_montserrat_14, COLOR_MUTED,
-                       10, 145, 220, LV_TEXT_ALIGN_CENTER);
-    s_status = make_label(s_screen, &lv_font_montserrat_14, COLOR_OK,
-                          10, 195, 220, LV_TEXT_ALIGN_CENTER);
-    s_hint = make_label(s_screen, &lv_font_montserrat_14, COLOR_MUTED,
-                        12, 252, 216, LV_TEXT_ALIGN_CENTER);
-
-    render_ui();
-    lv_screen_load(s_screen);
+    lv_label_set_text(s_title, "æœè¯ é€šé“");
+    lu_label_set_text_fmt(s_time, "%02u:%02u", hour, minute);
+    lv_obj_set_style_bg_color(s_card, lu_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_text_color(s_primary, lv_color_hex(COLOR_TEXT), 0);
+    lv_obj_set_style_text_color(s_secondary, lv_color_hex(status == MEDICINE_DAY_TAKEN ? COLOR_OK : COLOR_MUTED), 0);
+    lu_label_set_text_fmt(s_primary, "æé†’æ—¶é—´  %02u:%02u", s_model.reminder_hour, s_model.reminder_minute);
+    lv_label_set_text(s_secondary, day_status_text(status));
+    lu_label_set_text(s_hint, "é•¿æŒ‰ OK ä¿®æ”¹æé†’æ—¶é—´\né•¿æŒ‰ UP æ ¡æ—¶   é•¿æŒ‰ DOWN é‡æ–°é…ç½‘");
 }
 
-static void audio_write_note(int frequency, int duration_ms) {
-    int16_t samples[AUDIO_CHUNK];
-    int total = AUDIO_SAMPLE_RATE * duration_ms / 1000;
-    int period = frequency > 0 ? AUDIO_SAMPLE_RATE / frequency : 1;
-    int phase = 0;
-    while (total > 0) {
-        int count = total < AUDIO_CHUNK ? total : AUDIO_CHUNK;
-        for (int i = 0; i < count; ++i) {
-            samples[i] = frequency == 0 ? 0 : (phase < period / 2 ? 3800 : -3800);
-            if (++phase >= period) phase = 0;
-        }
-        if (bsp_audio_write(samples, (size_t)count * sizeof(samples[0])) != ESP_OK) break;
-        total -= count;
-    }
-}
+static void render_setting(void) {
+    bool hour_page = s_mode == SCREEN_SET_REMINDER_HOUR;
+    lv_label_set_text(s_title, hour_page ? "è®®ç½®æé†’å°æ—¶" : "è®¾å®šæé†’åˆ†é’Ÿâ");
+    lv_label_set_text_fmt(s_time, hour_page ? "%02u:--" : "%02u:%02u", s_edit_hour, s_edit_minute);
+    lu_obj_set_style_bg_color(s_card, lv_color_hex(COLOR_SOFTBLUE), 0);
+    lu_obj_set_style_text_color(s_primary, lu_color_hex(COLOR_TEXT), 0);
+    lv_obj_set_style_text_color(s_secondary, lu_color_hex(COLOR_MUTED), 0);
+    lv_label_set_text(s_primary, "UP / DOWN è¼ƒæ•´");
+    lv_label_set_text(s_secondary, hour_page ? "OK ä¸‹ä¸€é¡¹" : "OK ä¿å­˜");
+    lv_label_set_text(s_hint, "é•¿æŒ‰ OK å–æ¶ˆÈŠNÂŸB‚œİ]XÈ›ÚY™[™\—Ø[\›J›ÚY
+HÂˆWÛØš—ÜÙ]Üİ[WØ™×ØÛÛÜŠ×ÜØÜ™Y[‹WØÛÛÜ—Ú^
+‘‘Q
+K
+NÂˆ—ÛX™[ÜÙ]İ^
+×İ]Kº+éyd ú#kù.¢ÈŠNÂˆ—ÛX™[ÜÙ]İ^Ù›]
+×İ[YK‰LN‰LH‹×Û[Ù[œ™[Z[™\—Úİ\‹×Û[Ù[œ™[Z[™\—ÛZ[]JNÂˆ—ÛØš—ÜÙ]Üİ[WØ™×ØÛÛÜŠ×ØØ\™WØÛÛÜ—Ú^
+ÓÓÔ—ÔÓÑ•‘Q
+K
+NÂˆ—ÛØš—ÜÙ]Üİ[Wİ^ØÛÛÜŠ×Üš[X\K—ØÛÛÜ—Ú^
+ÓÓÔ—ÑS‘ÑTŠK
+NÂˆ—ÛØš—ÜÙ]Üİ[Wİ^ØÛÛÜŠ×ÜÙXÛÛ™\KWØÛÛÜ—Ú^
+ÓÓÔ—ÕV
+K
+NÂˆ—ÛX™[ÜÙ]İ^
+×Üš[X\K“ÒÈ9mì¹§#z#kÈŠNÂˆ—ÛX™[ÜÙ]İ^
+×ÜÙXÛÛ™\K•T9ní¹d#ˆL9b!ºd§×‘ÕÓˆ9.â¹¥éz-ìú/áÈŠNÂˆ—ÛX™[ÜÙ]İ^
+×Ú[¹èkº+©9d#º!ê¹bª9 kùlcùo¡y§.ˆŠNÂŸB‚œİ]XÈ›ÚY™[™\—ØÛÛ™š\›J›ÚY
+HÂˆWÛX™[ÜÙ]İ^
+×İ]K¹¤ãy/g9k£9¢$ŠNÂˆWÛX™[ÜÙ]İ^
+×İ[YK“ÒÈŠNÂˆ—ÛØš—ÜÙ]Üİ[WØ™×ØÛÛÜŠ×ØØ\™—ØÛÛÜ—Ú^
+ÓÓÔ—ÔÓÑ•Ô‘QSŠK
+NÂˆ—ÛØš—ÜÙ]Üİ[Wİ^ØÛÛÜŠ×Üš[X\K—ØÛÛÜ—Ú^
+ÓÓÔ—ÓÒÊK
+NÂˆ—ÛØš—ÜÙ]Üİ[Wİ^ØÛÛÜŠ×ÜÙXÛÛ™\KWØÛÛÜ—Ú^
+ÓÓÔ—ÓUUQ
+K
+NÂˆ—ÛX™[ÜÙ]İ^
+×Üš[X\K×ØÛÛ™š\›Wİ^
+NÂˆZ[İ™[XZ[ˆH×ØÛÛ™š\›WÙXY[™WÛ\Èˆ›İ×Û\Ê
+BˆÈ
+×ØÛÛ™š\›WÙXY[™WÛ\ÈH›İ×Û\Ê
+H
+ÈNNJHÈLˆˆÂˆ—ÛX™[ÜÙ]İ^Ù›]
+×ÜÙXÛÛ™\K‰[H9éä¹d#º!ê¹bª9 kùlcùo¡y§.ˆ‹ˆ
+[œÚYÛ™YÛ™ÈÛ™Ê\™[XZ[ŠNÂˆWÛX™[ÜÙ]İ^
+×Ú[¹o!y§.¹¥íˆÚKQšKú$çyâfy/çy£ yalúeëHŠNÂŸB‚œİ]XÈ›ÚY™[™\—İZJ›ÚY
+HÂˆYˆ
+\×ÜØÜ™Y[ŠH™]\›ÂˆWÛØš—ÜÙ]Üİ[WØ™×ØÛÛÜŠ×ÜØÜ™Y[‹WØÛÛÜ—Ú^
+ÓÓÔ—Ğ‘ÊK
+NÂˆ—ÛØš—ÜÙ]Üİ[Wİ^ØÛÛÜŠ×İ]KWØÛÛÜ—Ú^
+ÓÓÔ—ĞPĞÑS•
+K
+NÂˆWÛØš—ÜÙ]Üİ[Wİ^ØÛÛÜŠ×İ[YKWØÛÛÜ—Ú^
+ÓÓÔ—ÕV
+K
+NÂˆ—ÛØš—ÜÙ]Üİ[Wİ^ØÛÛÜŠ×Ú[—ØÛÛÜ—Ú^
+ÓÓÔ—ÓUUQ
+K
+NÂ‚ˆİÚ]Ú
+×Û[ÙJHÂˆØ\ÙHĞÔ‘QS—Ó‘UÓÔ’Îˆ™[™\—Û™]ÛÜšÊ
+NÈœ™XZÎÂˆØ\ÙHĞÔ‘QS—ÒÓQNˆ™[™\—ÚÛYJ
+NÈœ™XZÎÂˆØ\ÙHĞÔ‘QS—ÔÑUÔ‘SRS‘T—ÒÕT‚ˆØ\ÙHĞÔ‘QS—ÔÑUÔ‘SRS‘T—ÓRS•UNˆ™[™\—ÜÙ][™Ê
+NÈœ™XZÎÂˆØ\ÙHĞÔ‘QS—ĞST“Nˆ™[™\—Ø[\›J
+NÈœ™XZÎÂˆØ\ÙHĞÔ‘QS—ĞÓÓ‘’T“Nˆ™[™\—ØÛÛ™š\›J
+NÈœ™XZÎÂˆBŸB‚œİ]XÈ›ÚYZ[İZJ›ÚY
+HÂˆ×ÜØÜ™Y[ˆH—ÛØš—ØÜ™X]J•S
+NÂˆWÛØš—ÜÙ]Üİ[WØ™×ØÛÛÜŠ×ÜØÜ™Y[‹WØÛÛÜ—Ú^
+ÓÓÔ—Ğ‘ÊK
+NÂˆ—ÛØš—ÜÙ]Üİ[WØ™×ÛÜJ×ÜØÜ™Y[‹ÓÔWĞÓÕ‘T‹
+NÂˆ—ÛØš—ÜÙ]Üİ[WØ›Ü™\—İÚY
+×ÜØÜ™Y[‹
+NÂˆ—ÛØš—ÜÙ]Üİ[WÜYØ[
+×ÜØÜ™Y[‹
+NÂˆ—ÛØš—ØÛX\—Ù›YÊ×ÜØÜ™Y[‹ÓĞ’—Ñ“Q×ÔĞÔ“ÓP“JNÂ‚ˆ×İ]HHX™[ØÜ™X]J×ÜØÜ™Y[‹	›—Ù›ÛÜÛİ\˜ÙWÚ[—ÜØ[œ×ÜØ×ÌM—ØÚšËˆÓÓÔ—ĞPĞÑS•ŒŒÕVĞSQÓ—ĞÑS•TŠNÂˆWÛØš—ÜÙ]ÜÜÊ×İ]KLŒŠNÂ‚ˆ×İ[YHHX™[ØÜ™X]J×ÜØÜ™Y[‹	›—Ù›ÛÛ[ÛÙ\œ˜]ÌŒˆÓÓÔ—ÕVŒŒ—ÕVĞSQÓ—ĞÑS•TŠNÂˆ—ÛØš—ÜÙ]ÜÜÊ×İ[YKLŒÊNÂ‚ˆ×ØØ\™HØ\™ØÜ™X]J×ÜØÜ™Y[‹MLL‹ŒL‹LŒÓÓÔ—ĞĞT‘
+NÂˆ×Üš[X\HHX™[ØÜ™X]J×ØØ\™	›—Ù›ÛÜÛİ\˜ÙWÚ[—ÜØ[œ×ÜØ×ÌM—ØÚšËˆÓÓÔ—ÕVN—ÕVĞSQÓ—ĞÑS•TŠNÂˆ—ÛØš—Ø[YÛŠ×Üš[X\K—ĞSQÓ—ÕÔÓRQ
+NÂˆ×ÜÙXÛÛ™\HHX™[ØÜ™X]J×ØØ\™	›—Ù›ÛÜÛİ\˜ÙWÚ[—ÜØ[œ×ÜØ×ÌM—ØÚšËˆÓÓÔ—ÓUUQN—ÕVĞSQÓ—ĞÑS•TŠNÂˆ—ÛØš—Ø[YÛŠ×ÜÙXÛÛ™\KĞSQÓ—ÕÔÓRQ
+NÂ‚ˆ×Ú[HX™[ØÜ™X]J×ÜØÜ™Y[‹	›—Ù›ÛÜÛİ\˜ÙWÚ[—ÜØ[œ×ÜØ×ÌM—ØÚšËˆÓÓÔ—ÓUUQŒŒÕVĞSQÓ—ĞÑS•TŠNÂˆWÛØš—ÜÙ]ÜÜÊ×Ú[LL
+NÂ‚ˆ™[™\—İZJ
+NÂˆ—ÜØÜ™Y[—ÛØY
+×ÜØÜ™Y[ŠNÂŸB‚œİ]XÈ›ÚY]Y[×İÜš]WÛ›İJ[œ™\]Y[˜ŞK[\˜][Û—Û\ÊHÂˆ[M—İØ[\\ÖĞUQS×ĞÒS’×NÂˆ[İ[HUQS×ÔĞSTWÔUH
+ˆ\˜][Û—Û\ÈÈLÂˆ[\š[ÙHœ™\]Y[˜ŞHˆÈUQS×ÔĞSTWÔUHÈœ™\]Y[˜ŞHˆNÂˆ[\ÙHHÂˆÚ[H
+İ[ˆ
+HÂˆ[Ûİ[Hİ[UQS×ĞÒS’ÈÈİ[ˆUQS×ĞÒS’ÎÂˆ›Üˆ
+[HHÈHÛİ[È
+ÊÚJHÂˆØ[\\ÖÚWHHœ™\]Y[˜ŞHOHÈˆ
+\ÙH\š[ÙÈˆÈŒˆMŒ
+NÂˆYˆ
 
-static void audio_task(void *arg) {
-    (void)arg;
-    uint8_t event;
-    if (bsp_audio_set_format(AUDIO_SAMPLE_RATE, 16, 1) != ESP_OK) {
-        ESP_LOGW(TAG, "Audio reminder disabled: format setup failed");
-        s_audio_ok = false;
-        vTaskDelete(NULL);
-        return;
-    }
-    bsp_audio_set_volume(60);
-    for (;;) {
-        if (xQueueReceive(s_audio_queue, &event, portMAX_DELAY) != pdTRUE) continue;
-        (void)event;
-        audio_write_note(880, 120);
-        audio_write_note(0, 80);
-        audio_write_note(1175, 140);
-        audio_write_note(0, 80);
-        audio_write_note(880, 180);
-    }
-}
+ÊÜ\ÙHH\š[Ù
+H\ÙHHÂˆBˆYˆ
+œÜØ]Y[×İÜš]JØ[\\Ë
+Ú^™Wİ
+XÛİ[
+ˆÚ^™[ÙŠØ[\\ÖÌJJHOHTÔÓÒÊHœ™XZÎÂˆİ[OHÛİ[ÂˆBŸB‚œİ]XÈ›ÚY]Y[×İ\ÚÊ›ÚY
+˜\™ÊHÂˆ
+›ÚY
+X\™ÎÂˆZ[İ]™[ÂˆYˆ
+œÜØ]Y[×ÜÙ]Ù›Ü›X]
+UQS×ÔĞSTWÔUKM‹JHOHTÔÓÒÊHÂˆ×Ø]Y[×ÛÚÈH˜[ÙNÂˆ•\ÚÑ[]J•S
+NÂˆ™]\›ÂˆBˆœÜØ]Y[×ÜÙ]İ›Û[YJŒ
+NÂˆ›Üˆ
+ÎÊHÂˆYˆ
+]Y]YT™XÙZ]™J×Ø]Y[×Ü]Y]YK	™]™[ÜPVÑSVJHOH•QJHÛÛ[YNÂˆ
+›ÚY
+Y]™[Âˆ]Y[×İÜš]WÛ›İJM
+NÂˆ]Y[×İÜš]WÛ›İJ
+NÂˆ]Y[×İÜš]WÛ›İJLMÍKMŒ
+NÂˆ]Y[×İÜš]WÛ›İJ
+NÂˆ]Y[×İÜš]WÛ›İJŒŒ
+NÂˆBŸB‚œİ]XÈ›ÚY^WØ[\›WİÛ™J›ÚY
+HÂˆYˆ
+\×Ø]Y[×ÛÚÈ\×Ø]Y[×Ü]Y]YJH™]\›ÂˆZ[İ]™[HNÂˆ
+›ÚY
+^]Y]YSİ™\Üš]J×Ø]Y[×Ü]Y]YK	™]™[
+NÂŸB‚œİ]XÈZ[İÜ˜\Úİ\Š[˜[YJHÂˆÚ[H
+˜[YH
+H˜[YH
+ÏHÂˆÚ[H
+˜[YHH
+H˜[YHOHÂˆ™]\›ˆ
+Z[İ
+]˜[YNÂŸB‚œİ]XÈZ[İÜ˜\ÛZ[]J[˜[YJHÂˆÚ[H
+˜[YH
+H˜[YH
+ÏHŒÂˆÚ[H
+˜[YHHŒ
+H˜[YHOHŒÂˆ™]\›ˆ
+Z[İ
+]˜[YNÂŸB‚œİ]XÈ›ÚYİ\Û™]ÛÜšÊ›ÛÛ›Ü˜ÙWÜ›İš\Ú[ÛŠHÂˆ×Û[ÙHHĞÔ‘QS—Ó‘UÓÔ’ÎÂˆ×Û\İÜŞ[˜×Üİ]HH
+[YWÜŞ[˜×Üİ]Wİ
+KLNÂˆ\ÜÙ\œ—İ\œˆH[YWÜŞ[˜×Üİ\
+›Ü˜ÙWÜ›İš\Ú[ÛŠNÂˆYˆ
+\œˆOHTÔÓÒÈ	‰ˆ\œˆOHTÔÑT”—ÒS•SQÔÕU
+HÂˆTÔÓÑÑJQËØ[››İİ\[YHŞ[˜Îˆ	\È‹\ÜÙ\œ—İ×Û˜[YJ\œŠJNÂˆBˆ™[™\—İZJ
+NÂŸB‚œİ]XÈ›ÛÛ[™WÚ[œ]ÛØÚÙY
+ÛÛœİ[œ]Ù]™[İ
+š[œ]
+HÂˆ›ÛÛØ]™HH˜[ÙNÂ‚ˆYˆ
+×Û[ÙHOHĞÔ‘QS—Ó‘UÓÔ’ÊHÂˆYˆ
+[YWÜŞ[˜×ÙÙ]Üİ]J
+HOHSQWÔÖS×ÑRSQ	‰ˆ[œ]O™]™[OH”ÔĞ•—ĞÓPÒÊHÂˆYˆ
+[œ]O˜ˆOH”ÔĞ•—ÓÒÊHİ\Û™]ÛÜšÊ˜[ÙJNÂˆ[ÙHYˆ
+[œ]O˜ˆOH”ÔĞ•—ÑÕÓŠHİ\Û™]ÛÜšÊYJNÂˆBˆ™]\›ˆ˜[ÙNÂˆB‚ˆYˆ
+×Û[ÙHOHĞÔ‘QS—ĞST“H	‰ˆ[œ]O™]™[OH”ÔĞ•—ĞÓPÒÊHÂˆ[İ\ØÚÛZ[]HH\ØÚÛZ[]WÛ›İÊ
+NÂˆYˆ
+[œ]O˜ˆOH”ÔĞ•—ÓÒÈ	‰ˆYYXÚ[™WÛ[Ù[ÛX\š×İZÙ[Š	œ×Û[Ù[
+JHÂˆ×ØÛÛ™š\›Wİ^H¹mìº+¬9oey§#z#kÈÂˆØ]™HHYNÂˆH[ÙHYˆ
+[œ]O˜ˆOH”ÔĞ•—ÕT	‰ˆYYXÚ[™WÛ[Ù[ÜÛ›ÛŞ™J	œ×Û[Ù[\ØÚÛZ[]JJHÂˆ×ØÛÛ™š\›Wİ^H¹mì¹ní¹d#ˆL9b!ºd§ÈÂˆH[ÙHYˆ
+[œ]O˜ˆOH”ÔĞ•—ÑÕÓˆ	‰ˆYYXÚ[™WÛ[Ù[ÜÚÚ\İÙ^J	œ×Û[Ù[
+JHÂˆ×ØÛÛ™š\›Wİ^H¹.â¹¥éymìº-ìú/áÈÂˆØ]™HHYNÂˆH[ÙHÂˆ™]\›ˆ˜[ÙNÂˆBˆ×Û[ÙHHĞÔ‘QS—ĞÓÓ‘’T“NÂˆ×ØÛÛ™š\›WÙXY[™WÛ\ÈH›İ×Û\Ê
+H
+ÈÓÓ‘’T“WÔÕS‘–WÓTÎÂˆ™[™\—İZJ
+NÂˆ™]\›ˆØ]™NÂˆB‚ˆYˆ
+×Û[ÙHOHĞÔ‘QS—ÒÓQJHÂˆ™\Ù]ÚÛYWÚYJ
+NÂˆYˆ
+[œ]O™]™[OH”ÔĞ•—ÓÓ‘È	‰ˆ[œ]O˜ˆOH”ÔĞ•—ÓÒÊHÂˆ×ÙY]Úİ\ˆH×Û[Ù[œ™[Z[™\—Úİ\Âˆ×ÙY]ÛZ[]HH×Û[Ù[œ™[Z[™\—ÛZ[]NÂˆ×Û[ÙHHĞÔ‘QS—ÔÑUÔ‘SRS‘T—ÒÕTÂˆ™[™\—İZJ
+NÂˆH[ÙHYˆ
+[œ]O™]™[OH”ÔĞ•—ÓÓ‘È	‰ˆ[œ]O˜ˆOH”ÔĞ•—ÕT
+HÂˆİ\Û™]ÛÜšÊ˜[ÙJNÂˆH[ÙHYˆ
+[œ]O™]™[OH”ÔĞ•—ÓÓ‘È	‰ˆ[œ]O˜ˆOH”ÔĞ•—ÑÕÓŠHÂˆİ\Û™]ÛÜšÊYJNÂˆBˆ™]\›ˆ˜[ÙNÂˆB‚ˆYˆ
 
-static void play_alarm_tone(void) {
-    if (!s_audio_ok || !s_audio_queue) return;
-    uint8_t event = 1;
-    (void)xQueueOverwrite(s_audio_queue, &event);
-}
+×Û[ÙHOHĞÔ‘QS—ÔÑUÔ‘SRS‘T—ÒÕTˆ×Û[ÙHOHĞÔ‘QS—ÔÑUÔ‘SRS‘T—ÓRS•UJH	‰‚ˆ[œ]O™]™[OH”ÔĞ•—ÓÓ‘È	‰ˆ[œ]O˜ˆOH”ÔĞ•—ÓÒÊHÂˆ×Û[ÙHHĞÔ‘QQS—ÒÓQNÂˆ™\Ù]ÚÛYWÚYJ
+NÂˆ™[™\—İZJ
+NÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆYˆ
+[œ]O™]™[OH”ÔĞ•—ĞÓPÒÈ	‰ˆ[œ]O™]™[OH”ÔĞ•—ÑÕP“JH™]\›ˆ˜[ÙNÂˆ[İ\H[œ]O™]™[OH”ÔĞ•—ÑÕP“HÈHˆNÂˆYˆ
+×Û[ÙHOHĞÔ‘QS—ÔÑUÔ‘SRS‘T—ÒÕTŠHÂˆYˆ
+[œ]O˜ˆOH”ÔĞ•—ÕT
+H×ÙY]Úİ\ˆHÜ˜\Úİ\Š
+[
+\×ÙY]Úİ\ˆ
+Èİ\
+NÂˆ[ÙHYˆ
+[œ]O˜ˆOH”ÔĞ•—ÑÕÓŠH×ÙY]Úİ\ˆHÜ˜\Úİ\Š
+[
+\×ÙY]Úİ\ˆHİ\
+NÂˆ[ÙHYˆ
+[œ]O˜ˆOH”ÔĞ•—ÓÒÊH×Û[ÙHHĞÔ‘QS—ÔÑUÔ‘SRS‘T—ÓRS•UNÂˆH[ÙHYˆ
+×Û[ÙHOHĞÔ‘QQS—ÔÑUÔ‘SRS‘T—ÓRS•UJHÂˆ[Z[]WÜİ\H[œ]O™]™[OH”ÔĞ•—ÑÕP“HÈLˆNÂˆYˆ
+[œ]O˜ˆOH”ÔĞ•—ÕT
+H×ÙY]ÛZ[]HHÜ˜\ÛZ[]J
+[
+\×ÙY]ÛZ[]H
+ÈZ[]WÜİ\
+NÂˆ[ÙHYˆ
+[œ]O˜ˆOH”ÔĞ•—ÑÕÓŠH×ÙY]ÛZ[]HHÜ˜\ÛZ[]J
+[
+\×ÙY]ÛZ[]HHZ[]WÜİ\
+NÂˆ[ÙHYˆ
+[œ]O˜ˆOH”ÔĞ•—ÓÒÊHÂˆYYXÚ[™WÛ[Ù[ÜÙ]Ü™[Z[™\Š	œ×Û[Ù[×ÙY]Úİ\‹×ÙY]ÛZ[]KYJNÂˆØ]™HHYNÂˆ×Û[ÙHHĞÔ‘QQS—ÒÓQNÂˆ™\Ù]ÚÛYWÚYJ
+NÂˆBˆBˆ™[™\—İZJ
+NÂˆ™]\›ˆØ]™NÂŸB‚œİ]XÈ›ÚY[œ]İ\ÚÊ›ÚY
+˜\™ÊHÂˆ
+›ÚY
+X\™ÎÂˆ[œ]Ù]™[İ[œ]Âˆ›Üˆ
+ÎÊHÂˆYˆ
+]Y]YT™XÙZ]™J×Ú[œ]Ü]Y]YK	š[œ]ÜPVÑSVJHOH•QJHÛÛ[YNÂˆ›ÛÛØ]™HH˜[ÙNÂˆYˆ
+œÜÛ™ÛÛØÚÊL
+JHÂˆØ]™HH[™WÚ[œ]ÛØÚÙY
+	š[œ]
+NÂˆœÜÛ™Ûİ[›ØÚÊ
+NÂˆBˆYˆ
+Ø]™JHÂˆ\ÜÙ\œ—İ\œˆHYYXÚ[™WÜİÜ™WÜØ]™J	œ×Û[Ù[
+NÂˆYˆ
+\œˆOHTÔÓÒÊHTÔÓÑÕÊQË”Ø]™H˜Z[Yˆ	\È‹\ÜÙ\œ—İ×Û˜[YJ\œŠJNÂˆBˆBŸB‚œİ]XÈ›ÚYÛ—ÚÙ^JœÜØ—İ‹œÜØ—Ù]—İ]™[›ÚY
+\Ù\ŠHÂˆ
+›ÚY
+]\Ù\ÂˆYˆ
+\×Ú[œ]Ü™XYH\×Ú[œ]Ü]Y]YJH™]\›ÂˆÛÛœİ[œ]Ù]™[İ[œ]HË˜ˆH‹™]™[H]™[NÂˆ
+›ÚY
+^]Y]YTÙ[™
+×Ú[œ]Ü]Y]YK	š[œ]
+NÂŸB‚œİ]XÈ›ÚYÛ—ÜİÙ\—İØZÙJ›ÚY
+\Ù\ŠHÂˆ
+›ÚY
+]\Ù\Âˆ×İØZÙWÜ[™[™ÈHYNÂŸB‚œİ]XÈ›ÚY[\—Üİ[™J›ÚY
+HÂˆYˆ
+][YWÜŞ[˜×ØÛØÚ×İ˜[Y
 
-static uint8_t wrap_hour(int value) {
-    while (value < 0) value += 24;
-    while (value >= 24) value -= 24;
-    return (uint8_t)value;
-}
+H[YWÜŞ[˜×Ø\ŞJ
+HİÙ\—ÛX[˜YÙ\—Ø\ŞJ
+JH™]\›Âˆ[YWİØZÙHH™^İØZÙWÙ\ØÚ
 
-static uint8_t wrap_minute(int value) {
-    while (value < 0) value += 60;
-    while (value >= 60) value -= 60;
-    return (uint8_t)value;
-}
+NÂˆTÔÓÑÒJQË”İ[™H[[\ØÚI[‹
+Û™ÈÛ™Ê]ØZÙJNÂˆ\ÜÙ\œ—İ\œˆHİÙ\—ÛX[˜YÙ\—ÜÛY\İ[[
+ØZÙJNÂˆYˆ
+\œˆOHTÔÓÒÊHÂˆTÔÓÑÑJQË”İ[™H™\]Y\İ˜Z[Yˆ	\È‹\ÜÙ\œ—İ×Û˜[YJ\œŠJNÂˆ×Û[ÙHHĞÔ‘QS—ÒÓQNÂˆ™\Ù]ÚÛYWÚYJ
+NÂˆ™[™\—İZJ
+NÂˆBŸB‚œİ]XÈ›ÚYXÚÊ—İ[Y\—İ
+[Y\ŠHÂˆ
+›ÚY
+][Y\ÂˆZ[İ\ÈH›İ×Û\Ê
+NÂ‚ˆYˆ
+×İØZÙWÜ[™[™ÊHÂˆ×İØZÙWÜ[™[™ÈH˜[ÙNÂˆ×Û[ÙHHĞÔ‘QS—ÒÓQNÂˆ™\Ù]ÚÛYWÚYJ
+NÂˆ×Û\İÙ\Ü^WÛZ[]HHLNÂˆB‚ˆYˆ
+×Û[ÙHOHĞÔ‘QS—Ó‘UÓÔ’ÊHÂˆ[YWÜŞ[˜×Üİ]Wİİ]HH[YWÜŞ[˜×ÙÙ]Üİ]J
+NÂˆYˆ
+İ]HOH×Û\İÜŞ[˜×Üİ]JHÂˆ×Û\İÜŞ[˜×Üİ]HHİ]NÂˆ™[™\—İZJ
+NÂˆBˆYˆ
+İ]HOHSQWÔÖS×ÑÓ‘H	‰ˆ[YWÜŞ[˜×ØÛØÚ×İ˜[Y
 
-static bool handle_input_locked(const input_event_t *input) {
-    bool save_config = false;
-    uint64_t now = now_ms();
+JHÂˆ×Û[ÙHHĞÔ‘QS—ÒÓQNÂˆ™\Ù]ÚÛYWÚYJ
+NÂˆ™[™\—İZJ
+NÂˆBˆ™]\›ÂˆB‚ˆ[YWİ\ØÚÂˆ[Ì—İ^NÂˆZ[M—İZ[]WÛÙ—Ù^NÂˆZ[İZ[]NÂˆYˆ
+[ØØ[ÜÛ˜\Úİ
+	™\ØÚ	™^K	›Z[]WÛÙ—Ù^K•S	›Z[]JJH™]\›Â‚ˆYYXÚ[™WÙ]™[İ]™[HYYXÚ[™WÛ[Ù[İXÚÊ	œ×Û[Ù[
+[İ
+Y\ØÚÈŒˆ^KZ[]WÛÙ—Ù^JNÂˆYˆ
+]™[OHQQPÒS‘WÑU‘S•ĞST“JHÂˆ×Û[ÙHHĞÔ‘QS—ĞST“NÂˆœÜÙ\Ü^WØ˜XÚÛYÚ
+L
+NÂˆ^WØ[\›WİÛ™J
+NÂˆ™[™\—İZJ
+NÂˆ™]\›ÂˆB‚ˆYˆ
+×Û[ÙHOHĞÔ‘QS—ĞÓÓ‘’T“JHÂˆYˆ
+\ÈH×ØÛÛ™š\›WÙXY[™WÛ\ÊHÂˆ[\—Üİ[™J
+NÂˆH[ÙHÂˆ™[™\—ØÛÛ™š\›J
+NÂˆBˆ™]\›ÂˆB‚ˆYˆ
+×Û[ÙHOHĞÔ‘QS—ÒÓQJHÂˆYYXÚ[™WÙ^WÜİ]\×İİ]\ÈHYYXÚ[™WÛ[Ù[Ù^WÜİ]\Ê	œ×Û[Ù[^JNÂˆYˆ
+Z[]HOH×Û\İÙ\Ü^WÛZ[]Hİ]\ÈOH×Û\İÙ^WÜİ]\ÊHÂˆ×Û\İÙ\Ü^WÛZ[]HHZ[]NÂˆ×Û\İÙ^WÜİ]\ÈHİ]\ÎÂˆ™[™\—İZJ
+NÂˆBˆYˆ
+\ÈH×ÚÛYWÚYWÙXY[™WÛ\ÊH[\—Üİ[™J
+NÂˆBŸB‚œİ]XÈ\ÜÙ\œ—İ[œ]Ú[š]
+›ÚY
+HÂˆ×Ú[œ]Ü]Y]YHH]Y]YPÜ™X]JS”UÔUQUQWÑTÚ^™[ÙŠ[œ]Ù]™[İ
+JNÂˆYˆ
+\×Ú[œ]Ü]Y]YJH™]\›ˆTÔÑT”—Ó“×ÓQSNÂˆYˆ
+\ÚĞÜ™X]J[œ]İ\ÚË›YYXÚ[™WÚ[œ]‹M‹•SK	œ×Ú[œ]İ\ÚÊHOHTÔÊHÂˆ”]Y]YQ[]J×Ú[œ]Ü]Y]YJNÂˆ×Ú[œ]Ü]Y]YHH•SÂˆ™]\›ˆTÔÑT”—Ó“×ÓQSNÂˆBˆ™]\›ˆTÔÓÒÎÂŸB‚œİ]XÈ›ÚY]Y[×Ú[š]ÛÜ[Û˜[
+›ÚY
+HÂˆYˆ
+œÜØ]Y[×Ú[š]
 
-    if (s_mode == SCREEN_ALARM) {
-        if (input->event != BSP_BTN_CLICK) return false;
-        if (input->btn == BSP_BTN_OK && medicine_model_mark_taken(&s_model)) {
-            s_mode = SCREEN_HOME;
-        } else if (input->btn == BSP_BTN_UP && medicine_model_snooze(&s_model, now)) {
-            s_mode = SCREEN_HOME;
-        } else if (input->btn == BSP_BTN_DOWN && medicine_model_skip_today(&s_model)) {
-            s_mode = SCREEN_HOME;
-        }
-        render_ui();
-        return false;
-    }
+HOHTÔÓÒÊHÂˆTÔÓÑÕÊQË]Y[È[˜]˜Z[X›NÈš\İX[™[Z[™\ˆ™[XZ[œÈ]˜Z[X›HŠNÂˆ™]\›ÂˆBˆ×Ø]Y[×Ü]Y]YHH]Y]YPÜ™X]JUQS×ÔUQUQWÑTÚ^™[ÙŠZ[İ
+JNÂˆ×Ø]Y[×ÛÚÈH×Ø]Y[×Ü]Y]YHOH•SÂˆYˆ
+\×Ø]Y[×Ü]Y]YH\ÚĞÜ™X]J]Y[×İ\ÚË›YYXÚ[™WØ]Y[È‹ÌÌ‹•S•S
+HOHTÔÊHÂˆ×Ø]Y[×ÛÚÈH˜[ÙNÂˆYˆ
+×Ø]Y[×Ü]Y]YJHÂˆ”]Y]YQ[]J×Ø]Y[×Ü]Y]YJNÂˆ×Ø]Y[×Ü]Y]YHH•SÂˆBˆBŸB‚›ÚY\ÛXZ[Š›ÚY
+HÂˆTÔÓÑÒJQË“YYXÚ[™H™[Z[™\ˆŒˆİ\[™ÈŠNÂˆÙ][Š•ˆ‹ÔÕN‹JNÂˆœÙ]
 
-    if (s_mode == SCREEN_HOME) {
-        if (input->event == BSP_BTN_LONG && input->btn == BSP_BTN_OK) {
-            s_edit_hour = s_model.reminder_hour;
-            s_edit_minute = s_model.reminder_minute;
-            s_mode = SCREEN_SET_REMINDER_HOUR;
-            render_ui();
-        } else if (input->event == BSP_BTN_LONG && input->btn == BSP_BTN_UP) {
-            uint8_t hour = 8, minute = 0;
-            (void)medicine_model_clock(&s_model, now, &hour, &minute, NULL);
-            s_edit_hour = hour;
-            s_edit_minute = minute;
-            s_mode = SCREEN_SET_CLOCK_HOUR;
-            render_ui();
-        } else if (input->event == BSP_BTN_LONG && input->btn == BSP_BTN_DOWN) {
-            s_model.reminder_enabled = !s_model.reminder_enabled;
-            s_model.snooze_active = false;
-            s_model.alarm_active = false;
-            save_config = true;
-            render_ui();
-        }
-        return save_config;
-    }
+NÂ‚ˆYYXÚ[™WÛ[Ù[ÙY˜][Ê	œ×Û[Ù[
+NÂˆ\ÜÙ\œ—İİÜ™WÙ\œˆHYYXÚ[™WÜİÜ™WÚ[š]
+	œ×Û[Ù[
+NÂˆYˆ
+İÜ™WÙ\œˆOHTÔÓÒÊHÂˆTÔÓÑÕÊQË”\œÚ\İ[Ù][™ÜÈ[˜]˜Z[X›Nˆ	\È‹\ÜÙ\œ—İ×Û˜[YJİÜ™WÙ\œŠJNÂˆB‚ˆYˆ
+œÜÙ\Ü^WÚ[š]
 
-    if (input->event == BSP_BTN_LONG && input->btn == BSP_BTN_OK &&
-        (s_mode == SCREEN_SET_REMINDER_HOUR || s_mode == SCREEN_SET_REMINDER_MINUTE) &&
-        s_model.clock_valid) {
-        s_mode = SCREEN_HOME;
-        render_ui();
-        return false;
-    }
+HOHTÔÓÒÈXœÜÛ™ÛÚ[š]
 
-    if (input->event != BSP_BTN_CLICK && input->event != BSP_BTN_DOUBLE) return false;
-    int step = input->event == BSP_BTN_DOUBLE ? 5 : 1;
+JHÂˆTÔÓÑÑJQË‘\Ü^KÓ‘Ó[š]˜Z[YŠNÂˆ™]\›ÂˆBˆœÜÙ\Ü^WØ˜XÚÛYÚ
+ÌŠNÂ‚ˆ\ÜÙ\œ—İ[œ]Ù\œˆH[œ]Ú[š]
 
-    switch (s_mode) {
-        case SCREEN_SET_CLOCK_HOUR:
-            if (input->btn == BSP_BTN_UP) s_edit_hour = wrap_hour((int)s_edit_hour + step);
-            else if (input->btn == BSP_BTN_DOWN) s_edit_hour = wrap_hour((int)s_edit_hour - step);
-            else if (input->btn == BSP_BTN_OK) s_mode = SCREEN_SET_CLOCK_MINUTE;
-            break;
-        case SCREEN_SET_CLOCK_MINUTE:
-            if (input->btn == BSP_BTN_UP) s_edit_minute = wrap_minute((int)s_edit_minute + step);
-            else if (input->btn == BSP_BTN_DOWN) s_edit_minute = wrap_minute((int)s_edit_minute - step);
-            else if (input->btn == BSP_BTN_OK) {
-                medicine_model_set_clock(&s_model, s_edit_hour, s_edit_minute, now);
-                s_mode = SCREEN_HOME;
-            }
-            break;
-        case SCREEN_SET_REMINDER_HOUR:
-            if (input->btn == BSP_BTN_UP) s_edit_hour = wrap_hour((int)s_edit_hour + step);
-            else if (input->btn == BSP_BTN_DOWN) s_edit_hour = wrap_hour((int)s_edit_hour - step);
-            else if (input->btn == BSP_BTN_OK) s_mode = SCREEN_SET_REMINDER_MINUTE;
-            break;
-        case SCREEN_SET_REMINDER_MINUTE: {
-            int minute_step = input->event == BSP_BTN_DOUBLE ? 10 : 5;
-            if (input->btn == BSP_BTN_UP) s_edit_minute = wrap_minute((int)s_edit_minute + minute_step);
-            else if (input->btn == BSP_BTN_DOWN) s_edit_minute = wrap_minute((int)s_edit_minute - minute_step);
-            else if (input->btn == BSP_BTN_OK) {
-                medicine_model_set_reminder(&s_model, s_edit_hour, s_edit_minute, true);
-                save_config = true;
-                s_mode = SCREEN_HOME;
-            }
-            break;
-        }
-        case SCREEN_HOME:
-        case SCREEN_ALARM:
-            break;
-    }
-    render_ui();
-    return save_config;
-}
+NÂˆYˆ
+[œ]Ù\œˆOHTÔÓÒÊH×Ø]Û—ÛÚÈHœÜØ]Û—Ú[š]
+Û—ÚÙ^K•S
+HOHTÔÓÒÎÂˆYˆ
+\×Ø]Û—ÛÚÊHTÔÓÑÑJQË]Ûˆ[œ][˜]˜Z[X›HŠNÂ‚ˆ]Y[×Ú[š]ÛÜ[Û˜[
 
-static void input_task(void *arg) {
-    (void)arg;
-    input_event_t input;
-    for (;;) {
-        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) != pdTRUE) continue;
-        bool save_config = false;
-        if (bsp_lvgl_lock(500)) {
-            save_config = handle_input_locked(&input);
-            bsp_lvgl_unlock();
-        }
-        if (save_config) {
-            esp_err_t err = medicine_store_save(&s_model);
-            if (err != ESP_OK) ESP_LOGW(TAG, "Reminder save failed: %s", esp_err_to_name(err));
-        }
-    }
-}
-
-static void on_key(bsp_btn_t btn, bsp_btn_ev_t event, void *user) {
-    (void)user;
-    if (!s_input_ready || !s_input_queue) return;
-    const input_event_t input = {.btn = btn, .event = event};
-    (void)xQueueSend(s_input_queue, &input, 0);
-}
-
-static void timer_cb(lv_timer_t *timer) {
-    (void)timer;
-    uint64_t now = now_ms();
-    medicine_event_t event = medicine_model_tick(&s_model, now);
-    if (event == MEDICINE_EVENT_ALARM) {
-        s_mode = SCREEN_ALARM;
-        play_alarm_tone();
-        render_ui();
-        return;
-    }
-
-    if (s_mode == SCREEN_HOME) {
-        uint8_t minute = 0;
-        if (medicine_model_clock(&s_model, now, NULL, &minute, NULL)) {
-            medicine_day_status_t status = medicine_model_day_status(&s_model, now);
-            if (minute != s_last_minute || status != s_last_day_status) {
-                s_last_minute = minute;
-                s_last_day_status = status;
-                render_ui();
-            }
-        }
-    }
-}
-
-static esp_err_t input_init(void) {
-    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
-    if (!s_input_queue) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(input_task, "medicine_input", 4096, NULL, 5, &s_input_task) != pdPASS) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-static void audio_init_optional(void) {
-    if (bsp_audio_init() != ESP_OK) {
-        ESP_LOGW(TAG, "Audio unavailable; visual reminder will still work");
-        return;
-    }
-    s_audio_queue = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(uint8_t));
-    s_audio_ok = s_audio_queue != NULL;
-    if (!s_audio_queue || xTaskCreate(audio_task, "medicine_audio", 3072, NULL, 4, NULL) != pdPASS) {
-        ESP_LOGW(TAG, "Audio worker unavailable; visual reminder will still work");
-        s_audio_ok = false;
-        if (s_audio_queue) {
-            vQueueDelete(s_audio_queue);
-            s_audio_queue = NULL;
-        }
-        return;
-    }
-}
-
-void app_main(void) {
-    ESP_LOGI(TAG, "Medicine reminder starting");
-
-    medicine_model_defaults(&s_model);
-    esp_err_t store_err = medicine_store_init(&s_model);
-    if (store_err != ESP_OK) {
-        ESP_LOGW(TAG, "Persistent settings unavailable this boot: %s", esp_err_to_name(store_err));
-    }
-
-    if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-        ESP_LOGE(TAG, "Display/LVGL init failed");
-        return;
-    }
-    bsp_display_backlight(75);
-
-    esp_err_t input_err = input_init();
-    if (input_err == ESP_OK) {
-        s_button_ok = bsp_button_init(on_key, NULL) == ESP_OK;
-    }
-    if (!s_button_ok) ESP_LOGE(TAG, "Button input unavailable");
-
-    audio_init_optional();
-
-    s_edit_hour = 8;
-    s_edit_minute = 0;
-    s_mode = SCREEN_SET_CLOCK_HOUR;
-    if (bsp_lvgl_lock(1000)) {
-        build_ui();
-        s_timer = lv_timer_create(timer_cb, 250, NULL);
-        bsp_lvgl_unlock();
-    }
-
-    s_input_ready = s_button_ok;
-    ESP_LOGI(TAG, "Ready: reminder=%02u:%02u audio=%d buttons=%d",
-             s_model.reminder_hour, s_model.reminder_minute, s_audio_ok, s_button_ok);
-}
+NÂˆ
+›ÚY
+\İÙ\—ÛX[˜YÙ\—Ú[š]
+Û—ÜİÙ\—İØZÙK•S
+NÂ‚ˆYˆ
+œÜÛ™ÛÛØÚÊL
+JHÂˆZ[İZJ
+NÂˆ×İ[Y\ˆH—İ[Y\—ØÜ™X]JXÚËL•S
+NÂˆœÜÛ™Ûİ[›ØÚÊ
+NÂˆBˆ×Ú[œ]Ü™XYHH×Ø]Û—ÛÚÎÂ‚ˆ\ÜÙ\œ—İŞ[˜×Ù\œˆH[YWÜŞ[˜×Üİ\
+˜[ÙJNÂˆYˆ
+Ş[˜×Ù\œˆOHTÔÓÒÊHÂˆTÔÓÑÑJQË’[š]X[[YHŞ[˜Èİ\˜Z[Yˆ	\È‹\ÜÙ\œ—İ×Û˜[YJŞ[˜×Ù\œŠJNÂˆBŸB

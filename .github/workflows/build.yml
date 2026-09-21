@@ -32,9 +32,10 @@ jobs:
       - name: Create application branch and apply overlay
         shell: bash
         run: |
-          git -C firmware switch -c feature/medicine-reminder
+          git -C firmware switch -c feature/medicine-reminder-v2
           cp -a app/overlay/main/. firmware/main/
           cp -a app/overlay/tests/. firmware/tests/
+          cat app/overlay/sdkconfig.defaults.append >> firmware/sdkconfig.defaults
 
       - name: Run medicine model tests
         shell: bash
@@ -63,7 +64,7 @@ jobs:
       - name: Upload flashable firmware and debug bundle
         uses: actions/upload-artifact@v4
         with:
-          name: medicine-reminder-firmware-${{ github.sha }}
+          name: medicine-reminder-v2-firmware-${{ github.sha }}
           path: |
             firmware/build/FoloToy-AI-Passport-full.bin
             firmware/build/firmware/**
