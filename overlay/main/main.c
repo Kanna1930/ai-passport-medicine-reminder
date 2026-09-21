@@ -127,23 +127,16 @@ static void render(void) {
         lv_label_set_text(g_clock, "--:--");
         switch (s) {
         case TIME_SYNC_CONNECTING:
-            lv_label_set_text(g_body, "正在连接已保存的 Wi-Fi
-联网仅用于校准时间");
+            lv_label_set_text(g_body, "正在连接已保存的 Wi-Fi\n联网仅用于校准时间");
             lv_label_set_text(g_hint, "校时完成后自动关闭网络");
             break;
         case TIME_SYNC_PROVISIONING:
             lv_label_set_text(g_body,
-                "首次使用，请完成配网
-
-微信小程序：
-蓝牙配网-FoloToy AI PASSPORT
-
-设备：BLUFI_FoloPassport");
+                "首次使用，请完成配网\n\n微信小程序：\n蓝牙配网-FoloToy AI PASSPORT\n\n设备：BLUFI_FoloPassport");
             lv_label_set_text(g_hint, "请选择 2.4GHz Wi-Fi");
             break;
         case TIME_SYNC_PHONE_CONNECTED:
-            lv_label_set_text(g_body, "手机已连接设备
-请在小程序中发送 Wi-Fi 信息");
+            lv_label_set_text(g_body, "手机已连接设备\n请在小程序中发送 Wi-Fi 信息");
             lv_label_set_text(g_hint, "等待配网");
             break;
         case TIME_SYNC_WIFI_CONNECTING:
@@ -151,8 +144,7 @@ static void render(void) {
             lv_label_set_text(g_hint, "连接后立即校准时间");
             break;
         case TIME_SYNC_SNTP:
-            lv_label_set_text(g_body, "网络已连接
-正在自动校准时间");
+            lv_label_set_text(g_body, "网络已连接\n正在自动校准时间");
             lv_label_set_text(g_hint, "完成后关闭 Wi-Fi 和蓝牙");
             break;
         case TIME_SYNC_DONE:
@@ -160,8 +152,7 @@ static void render(void) {
             lv_label_set_text(g_hint, "网络已关闭");
             break;
         case TIME_SYNC_FAILED:
-            lv_label_set_text(g_body, "校时失败
-请检查网络");
+            lv_label_set_text(g_body, "校时失败\n请检查网络");
             lv_label_set_text(g_hint, "OK 重试  DOWN 重新配网");
             break;
         default:
@@ -186,10 +177,7 @@ static void render(void) {
         lv_obj_set_style_bg_color(g_screen, lv_color_hex(0xFFF1F2), 0);
         lv_label_set_text(g_title, "该吃药了");
         lv_label_set_text_fmt(g_clock, "%02u:%02u", g_model.reminder_hour, g_model.reminder_minute);
-        lv_label_set_text(g_body, "OK  已服药
-
-UP  延后 10 分钟
-DOWN  今日跳过");
+        lv_label_set_text(g_body, "OK  已服药\n\nUP  延后 10 分钟\nDOWN  今日跳过");
         lv_label_set_text(g_hint, "确认后自动息屏待机");
         return;
     }
@@ -207,13 +195,10 @@ DOWN  今日跳过");
     (void)local_now(NULL, &day, NULL, &h, &m);
     lv_label_set_text(g_title, "服药提醒");
     lv_label_set_text_fmt(g_clock, "%02u:%02u", h, m);
-    lv_label_set_text_fmt(g_body, "提醒时间  %02u:%02u
-
-%s",
+    lv_label_set_text_fmt(g_body, "提醒时间  %02u:%02u\n\n%s",
                           g_model.reminder_hour, g_model.reminder_minute,
                           status_text(medicine_model_day_status(&g_model, day)));
-    lv_label_set_text(g_hint, "长按 OK 修改提醒
-长按 UP 校时  长按 DOWN 重新配网");
+    lv_label_set_text(g_hint, "长按 OK 修改提醒\n长按 UP 校时  长按 DOWN 重新配网");
 }
 
 static void ui_init(void) {
